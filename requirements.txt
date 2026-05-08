@@ -1,0 +1,42 @@
+# x1025-Maritime-Intelligence -- direct project dependencies
+#
+# For an exact, reproducible environment use environment.yml (conda):
+#     conda env create -f environment.yml
+#
+# This requirements.txt lists only the top-level libraries the source code
+# imports. Pin versions if you need reproducibility outside of conda.
+
+# --- Core ML / GPU ---
+torch
+torchvision
+transformers
+accelerate
+sentence-transformers
+einops
+
+# --- Retrieval / storage ---
+lancedb
+pyarrow
+tantivy
+
+# --- LLM serving ---
+# llama-cpp-python must be built with CUDA support:
+#   CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir \
+#       --force-reinstall --no-binary=llama-cpp-python
+llama-cpp-python
+
+# --- Document parsing (Layer 1 ingestion) ---
+docling
+docling-core
+
+# --- Vision-language captioner (Layer 1 ingestion) ---
+lmdeploy
+
+# --- Utilities ---
+python-dotenv
+numpy
+pillow
+tqdm
+
+# --- Tests ---
+pytest
