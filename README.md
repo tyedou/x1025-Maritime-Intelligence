@@ -83,7 +83,7 @@ The four files marked ✅ above form a complete, runnable RAG pipeline:
 
 ```bash
 # Clone the repository
-git clone https://github.com/<org>/x1025-Maritime-Intelligence.git
+git clone https://github.com/tyedou/x1025-Maritime-Intelligence.git
 cd x1025-Maritime-Intelligence
 
 # Create the Conda environment from the exported file
@@ -100,7 +100,7 @@ CMAKE_ARGS="-DGGML_CUDA=on" pip install llama-cpp-python --no-cache-dir \
     --force-reinstall --no-binary=llama-cpp-python
 ```
 
-Copy `.env.example` to `.env` and configure `HF_HOME` and `HF_TOKEN` so HuggingFace models download to your designated persistent cache (the first run pulls ~80 GB of weights across all stages).
+Copy `.env.example` to `.env` and configure `HF_HOME` and `HF_TOKEN` so HuggingFace models download to your designated persistent cache (~45 GB for the SafetyAgent retrieval+generation path; ~80 GB total if you also run ingestion, since InternVL2.5-38B-AWQ adds ~35 GB more).
 
 ## Quickstart — Layer 1 RAG
 
@@ -131,6 +131,33 @@ python -m frontend.chat_interface.cli
 ```
 Inside the chat: type a question, `switch` to pick a different manual, or `quit`/Ctrl+D to exit.
 
+**Web chat (ChatGPT-style UI)** — Next.js + Tailwind frontend that
+streams answers from a FastAPI bridge wrapping the same `SafetyAgent`. Two
+shells:
+
+```bash
+# shell 1 — backend (real GPU mode)
+uvicorn backend.chat_api.main:app --reload --port 8001
+
+# shell 1 — backend (mock mode for UI dev, no GPU)
+CHAT_API_MOCK=1 uvicorn backend.chat_api.main:app --reload --port 8001
+
+# shell 2 — frontend
+cd frontend/chat_interface/web
+npm install   # first time only
+npm run dev
+```
+
+Open `http://localhost:3000`. If `localhost:3000` doesn't reach your browser
+(some networks intercept SSH port forwarding), use `scripts/demo.sh` instead —
+it exposes the backend over a public cloudflared tunnel and serves a minimal
+same-origin chat at `/chat` for debugging. When the Next.js frontend lives
+behind a different origin than the backend, set `NEXT_PUBLIC_CHAT_API_URL`
+before `npm run dev` so the browser fetches and the WebSocket target the
+right host. See `backend/chat_api/README.md` and
+`frontend/chat_interface/web/README.md` for the wire protocol and component
+layout.
+
 **One-shot CLI** — useful for scripted evaluation or single questions.
 ```bash
 python -m agents.safety_agent data/lancedb/<folder>_lancedb.lance "your question here"
@@ -140,6 +167,35 @@ python -m agents.safety_agent data/lancedb/<folder>_lancedb.lance "your question
 ```bash
 python -m agents.safety_agent --retrieve-only data/lancedb/<folder>_lancedb.lance "your query"
 ```
+
+### Quick demo (one command)
+
+For a reproducible demo on chimera, `scripts/demo.sh` boots uvicorn, waits for
+the SafetyAgent to load, starts a public cloudflared tunnel, and prints the
+`/chat` URL. Ctrl+C in the shell shuts down both processes cleanly.
+
+```bash
+# from a chimera login shell — open an interactive GPU allocation
+salloc -c2 -A impact -q aicore --gres=gpu:4 --mem=32G \
+       -w chimera24 -p AICORE_H200 -t 720
+
+# inside the allocation
+cd ~/x1025_fi/x1025-Maritime-Intelligence
+./scripts/demo.sh
+```
+
+The script prints a `https://*.trycloudflare.com/chat` URL — open it in any
+browser. Trycloudflare URLs are random and ephemeral; for a stable URL,
+configure a named cloudflared tunnel under your own Cloudflare account.
+
+`MOCK=1 ./scripts/demo.sh` skips the GPU pipeline and serves canned answers
+(useful for verifying the wire without holding a SLURM allocation). Other
+knobs: `PORT=…`, `CONDA_ENV=…`, `CLOUDFLARED=/path/to/binary`. Logs land in
+`/tmp/x1025-demo/`.
+
+Prerequisite (one-time, per host): a `cloudflared` binary somewhere on disk
+(`wget` it from `github.com/cloudflare/cloudflared/releases/latest`) and an
+ingested LanceDB table at `data/lancedb/*.lance` (Phase 1 above).
 
 ## Performance demonstration
 
@@ -165,6 +221,8 @@ Building this pipeline involved solving several real limitations of modern LLMs 
 | 1 | `backend/ingestion/vision_captioner.py` | ✅ Working |
 | 1 | `backend/storage/lancedb_client.py` | ✅ Working |
 | 1 | `frontend/chat_interface/cli.py` (interim Python REPL) | ✅ Working |
+| 1 | `backend/chat_api/` (FastAPI WebSocket bridge to SafetyAgent) | ✅ Working |
+| 1 | `frontend/chat_interface/web/` (Next.js + Tailwind + shadcn chat UI) | ✅ Working |
 | 2 | `agents/analytics_agent.py`, `backend/stream/`, `backend/storage/timeseries_db.py` | ⏸ Not yet scaffolded |
 | 3 | `agents/superintendent.py` | ⏸ Stretch goal |
 | — | `agents/supervisor.py` | ⏸ Not yet scaffolded |
