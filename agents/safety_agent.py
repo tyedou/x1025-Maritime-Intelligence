@@ -80,7 +80,9 @@ _RERANK_PROMPT = (
 def _load_reranker():
     tokenizer = AutoTokenizer.from_pretrained(_RERANKER_ID, trust_remote_code=True, padding_side="left")
     device = "cuda:1" if torch.cuda.device_count() > 1 else "cuda:0"
-    model = AutoModelForCausalLM.from_pretrained(_RERANKER_ID, torch_dtype=torch.float16, device_map=device).eval()
+    model = AutoModelForCausalLM.from_pretrained(_RERANKER_ID, torch_dtype=torch.float16).eval().to(device)
+    if str(model.device) == "cpu":
+        raise RuntimeError(f"Reranker landed on CPU; expected {device}. Check CUDA_VISIBLE_DEVICES and torch CUDA build.")
     return model, tokenizer, tokenizer.convert_tokens_to_ids("yes"), tokenizer.convert_tokens_to_ids("no")
 
 def _rerank(reranker, query: str, candidates: list, top_n: int, batch_size: int = 16) -> list:
@@ -106,6 +108,10 @@ _LLM_FILE = "Qwen3.6-35B-A3B-UD-Q6_K.gguf"
 _LLM_CTX = 8192
 _LLM_MAX_NEW_TOKENS = 1024
 _LLM_SLICE_INDEX = 2
+# Char budget for retrieved-chunk context. Conservative ~4 chars/token gives ~6k tokens,
+# leaving room for system prompt, question, template overhead, and _LLM_MAX_NEW_TOKENS output
+# under _LLM_CTX. Prevents the "Requested tokens exceed context window" crash on dense retrievals.
+_PROMPT_CHAR_BUDGET = 24000
 _SYSTEM_PROMPT = (
     "You are a highly precise technical assistant.\n\n"
     "Rules:\n"
@@ -144,23 +150,32 @@ def _llm_worker(conn):
             break
         if prompt is None:
             break
-        for chunk in llm(
-            prompt,
-            max_tokens=_LLM_MAX_NEW_TOKENS,
-            temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5,
-            stop=["<|im_end|>"],
-            stream=True,
-        ):
-            conn.send(chunk["choices"][0]["text"])
+        try:
+            for chunk in llm(
+                prompt,
+                max_tokens=_LLM_MAX_NEW_TOKENS,
+                temperature=0.7, top_p=0.8, top_k=20, presence_penalty=1.5,
+                stop=["<|im_end|>"],
+                stream=True,
+            ):
+                conn.send(chunk["choices"][0]["text"])
+        except Exception as exc:
+            conn.send(("__error__", f"{type(exc).__name__}: {exc}"))
         conn.send(None)  # end-of-stream sentinel
 
 def _build_prompt(query: str, chunks: list) -> str:
     parts = []
+    used = 0
+    sep_len = len("\n\n---\n\n")
     for i, c in enumerate(chunks, 1):
         header = f"[{i}] Section: {c['section']}"
         if c["chunk_type"] == "image":
             header += f"\n[Figure: {c['image_src']}] Description:"
-        parts.append(f"{header}\n{c['text']}")
+        block = f"{header}\n{c['text']}"
+        if parts and used + len(block) + sep_len > _PROMPT_CHAR_BUDGET:
+            break
+        parts.append(block)
+        used += len(block) + sep_len
     context = "\n\n---\n\n".join(parts)
     user_content = (
         "Use the following passages from the technical document or report to answer the question.\n\n"
@@ -205,16 +220,38 @@ class SafetyAgent:
         candidates = hybrid_search(self.table, vec, query, k)
         return _rerank(self.reranker, query, candidates, top_n)
 
+    def _ensure_llm_alive(self) -> None:
+        if self.llm_proc is not None and self.llm_proc.is_alive():
+            return
+        try:
+            self.llm_conn.close()
+        except Exception:
+            pass
+        if self.llm_proc is not None:
+            try:
+                self.llm_proc.join(timeout=1)
+            except Exception:
+                pass
+        self.llm_proc, self.llm_conn = self._spawn_llm()
+
     def generate_stream(self, query: str, chunks: list):
         """Yield token chunks from the LLM as they're produced."""
-        self.llm_conn.send(_build_prompt(query, chunks))
+        self._ensure_llm_alive()
+        prompt = _build_prompt(query, chunks)
+        try:
+            self.llm_conn.send(prompt)
+        except (BrokenPipeError, OSError):
+            self._ensure_llm_alive()
+            self.llm_conn.send(prompt)
         while True:
             try:
                 chunk = self.llm_conn.recv()
             except EOFError:
-                raise RuntimeError(f"LLM subprocess crashed (exit code {self.llm_proc.exitcode})")
+                raise RuntimeError(f"LLM subprocess died (exit code {self.llm_proc.exitcode})")
             if chunk is None:
                 return
+            if isinstance(chunk, tuple) and len(chunk) == 2 and chunk[0] == "__error__":
+                raise RuntimeError(f"LLM error: {chunk[1]}")
             yield chunk
 
     def generate(self, query: str, chunks: list) -> str:
